@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/dave/dst"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -98,6 +99,35 @@ func TestWriteFileAtomic(t *testing.T) {
 	assert.Contains(t, string(data), "func Bar()")
 }
 
+// unprintableFile returns an AST that the restorer cannot turn back into
+// source: go/format re-parses files with grouped imports, and a function
+// named "1bad" does not parse.
+func unprintableFile(t *testing.T) *dst.File {
+	t.Helper()
+
+	p := NewAstParser()
+	file, err := p.ParseSource("package main\n\nimport (\n\t\"fmt\"\n)\n\nfunc Foo() { fmt.Println() }\n")
+	require.NoError(t, err)
+
+	FindFuncDeclWithoutRecv(file, "Foo").Name = dst.NewIdent("1bad")
+	return file
+}
+
+func TestPrintFile_RestoreError(t *testing.T) {
+	data, err := PrintFile(unprintableFile(t))
+	require.ErrorContains(t, err, "failed to restore AST")
+	assert.Nil(t, data)
+}
+
+func TestWriteFileAtomic_RestoreError(t *testing.T) {
+	out := filepath.Join(t.TempDir(), "atomic.go")
+
+	err := WriteFileAtomic(out, unprintableFile(t))
+	require.ErrorContains(t, err, "failed to restore AST")
+	require.ErrorContains(t, err, out)
+	assert.NoFileExists(t, out)
+}
+
 func TestParseAst(t *testing.T) {
 	_, err := ParseFile("parser_test.go")
 	require.NoError(t, err)
@@ -169,11 +199,16 @@ func TestWriteFile_CreateError(t *testing.T) {
 }
 
 type mockWriteCloser struct {
-	writeErr error
-	closeErr error
+	writeErr     error
+	closeErr     error
+	panicOnWrite bool
+	closed       bool
 }
 
 func (m *mockWriteCloser) Write(p []byte) (int, error) {
+	if m.panicOnWrite {
+		panic("simulated write panic")
+	}
 	if m.writeErr != nil {
 		return 0, m.writeErr
 	}
@@ -181,6 +216,7 @@ func (m *mockWriteCloser) Write(p []byte) (int, error) {
 }
 
 func (m *mockWriteCloser) Close() error {
+	m.closed = true
 	return m.closeErr
 }
 
@@ -202,4 +238,13 @@ func TestWriteFile_CloseError(t *testing.T) {
 	err = writeFile(mock, "out.go", f)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to close file")
+}
+
+func TestWriteFile_PanicSafety(t *testing.T) {
+	f, err := ParseFile("parser_test.go")
+	require.NoError(t, err)
+
+	mock := &mockWriteCloser{panicOnWrite: true}
+	require.Panics(t, func() { _ = writeFile(mock, "out.go", f) })
+	assert.True(t, mock.closed, "the file must be closed even when writing panics")
 }

@@ -15,6 +15,8 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/propagation"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	semconv "go.opentelemetry.io/otel/semconv/v1.37.0"
@@ -32,6 +34,62 @@ func setupTestTracer(t *testing.T) (*tracetest.SpanRecorder, *sdktrace.TracerPro
 	otel.SetTextMapPropagator(propagation.TraceContext{})
 	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
 	return sr, tp
+}
+
+func setupTestMeter(t *testing.T) *sdkmetric.ManualReader {
+	t.Helper()
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	otel.SetMeterProvider(provider)
+	t.Cleanup(func() { _ = provider.Shutdown(context.Background()) })
+	return reader
+}
+
+func TestServeHTTPRecordsMetrics(t *testing.T) {
+	t.Setenv("OTEL_GO_ENABLED_INSTRUMENTATIONS", "nethttp")
+	initOnce = *new(sync.Once)
+	setupTestTracer(t)
+	reader := setupTestMeter(t)
+
+	req := httptest.NewRequest(http.MethodPost, "http://example.com/path", nil)
+	req.ContentLength = 12
+	ctx := hooktest.NewMockHookContext()
+	BeforeServeHTTP(ctx, nil, httptest.NewRecorder(), req)
+	w, ok := ctx.GetParam(responseWriterIndex).(http.ResponseWriter)
+	require.True(t, ok)
+	w.WriteHeader(http.StatusCreated)
+	_, err := w.Write([]byte("response"))
+	require.NoError(t, err)
+	AfterServeHTTP(ctx)
+
+	var got metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(context.Background(), &got))
+	metrics := make(map[string]metricdata.Metrics)
+	for _, scope := range got.ScopeMetrics {
+		for _, metric := range scope.Metrics {
+			metrics[metric.Name] = metric
+		}
+	}
+
+	requestSize, ok := metrics["http.server.request.body.size"].Data.(metricdata.Histogram[int64])
+	require.True(t, ok)
+	require.Len(t, requestSize.DataPoints, 1)
+	assert.Equal(t, int64(12), requestSize.DataPoints[0].Sum)
+
+	responseSize, ok := metrics["http.server.response.body.size"].Data.(metricdata.Histogram[int64])
+	require.True(t, ok)
+	require.Len(t, responseSize.DataPoints, 1)
+	assert.Equal(t, int64(len("response")), responseSize.DataPoints[0].Sum)
+
+	duration, ok := metrics["http.server.request.duration"].Data.(metricdata.Histogram[float64])
+	require.True(t, ok)
+	require.Len(t, duration.DataPoints, 1)
+	assert.Equal(t, uint64(1), duration.DataPoints[0].Count)
+
+	active, ok := metrics["http.server.active_requests"].Data.(metricdata.Sum[int64])
+	require.True(t, ok)
+	require.Len(t, active.DataPoints, 1)
+	assert.Equal(t, int64(0), active.DataPoints[0].Value)
 }
 
 func TestBeforeServeHTTP(t *testing.T) {
@@ -133,12 +191,11 @@ func TestBeforeServeHTTP(t *testing.T) {
 				assert.Equal(t, 0, len(spans), "span should not be ended in Before hook")
 
 				// Check that data was stored
-				data, ok := mockCtx.GetData().(map[string]interface{})
+				data, ok := mockCtx.GetData().(*hookData)
 				require.True(t, ok, "data should be stored")
 				require.NotNil(t, data, "data should not be nil")
 
-				span, ok := data["span"].(trace.Span)
-				require.True(t, ok, "span should be in data")
+				span := data.span
 				require.NotNil(t, span, "span should not be nil")
 
 				if tt.validateSpan != nil {
@@ -184,7 +241,7 @@ func TestAfterServeHTTP(t *testing.T) {
 			},
 			setupContext: func(tp *sdktrace.TracerProvider) hook.HookContext {
 				testTracer := tp.Tracer(instrumentationName)
-				ctx, span := testTracer.Start(
+				_, span := testTracer.Start(
 					context.Background(),
 					"GET /path",
 					trace.WithSpanKind(trace.SpanKindServer),
@@ -196,10 +253,7 @@ func TestAfterServeHTTP(t *testing.T) {
 					statusCode:     200,
 				}
 				mockCtx.SetParam(1, wrapper)
-				mockCtx.SetData(map[string]interface{}{
-					"ctx":  ctx,
-					"span": span,
-				})
+				mockCtx.SetData(&hookData{span: span})
 				return mockCtx
 			},
 			statusCode: 200,
@@ -216,7 +270,7 @@ func TestAfterServeHTTP(t *testing.T) {
 			},
 			setupContext: func(tp *sdktrace.TracerProvider) hook.HookContext {
 				testTracer := tp.Tracer(instrumentationName)
-				ctx, span := testTracer.Start(
+				_, span := testTracer.Start(
 					context.Background(),
 					"GET /notfound",
 					trace.WithSpanKind(trace.SpanKindServer),
@@ -228,10 +282,7 @@ func TestAfterServeHTTP(t *testing.T) {
 					statusCode:     404,
 				}
 				mockCtx.SetParam(1, wrapper)
-				mockCtx.SetData(map[string]interface{}{
-					"ctx":  ctx,
-					"span": span,
-				})
+				mockCtx.SetData(&hookData{span: span})
 				return mockCtx
 			},
 			statusCode: 404,
@@ -249,7 +300,7 @@ func TestAfterServeHTTP(t *testing.T) {
 			},
 			setupContext: func(tp *sdktrace.TracerProvider) hook.HookContext {
 				testTracer := tp.Tracer(instrumentationName)
-				ctx, span := testTracer.Start(
+				_, span := testTracer.Start(
 					context.Background(),
 					"GET /error",
 					trace.WithSpanKind(trace.SpanKindServer),
@@ -261,10 +312,7 @@ func TestAfterServeHTTP(t *testing.T) {
 					statusCode:     500,
 				}
 				mockCtx.SetParam(1, wrapper)
-				mockCtx.SetData(map[string]interface{}{
-					"ctx":  ctx,
-					"span": span,
-				})
+				mockCtx.SetData(&hookData{span: span})
 				return mockCtx
 			},
 			statusCode: 500,
@@ -295,7 +343,7 @@ func TestAfterServeHTTP(t *testing.T) {
 			},
 			setupContext: func(tp *sdktrace.TracerProvider) hook.HookContext {
 				testTracer := tp.Tracer(instrumentationName)
-				ctx, span := testTracer.Start(
+				_, span := testTracer.Start(
 					context.Background(),
 					"GET /path",
 					trace.WithSpanKind(trace.SpanKindServer),
@@ -307,10 +355,7 @@ func TestAfterServeHTTP(t *testing.T) {
 					statusCode:     200,
 				}
 				mockCtx.SetParam(1, wrapper)
-				mockCtx.SetData(map[string]interface{}{
-					"ctx":  ctx,
-					"span": span,
-				})
+				mockCtx.SetData(&hookData{span: span})
 				return mockCtx
 			},
 			statusCode: 200,
@@ -326,7 +371,7 @@ func TestAfterServeHTTP(t *testing.T) {
 			},
 			setupContext: func(tp *sdktrace.TracerProvider) hook.HookContext {
 				testTracer := tp.Tracer(instrumentationName)
-				ctx, span := testTracer.Start(
+				_, span := testTracer.Start(
 					context.Background(),
 					"GET /path",
 					trace.WithSpanKind(trace.SpanKindServer),
@@ -334,10 +379,7 @@ func TestAfterServeHTTP(t *testing.T) {
 
 				mockCtx := hooktest.NewMockHookContext()
 				// Don't set param 1, defaults to 200
-				mockCtx.SetData(map[string]interface{}{
-					"ctx":  ctx,
-					"span": span,
-				})
+				mockCtx.SetData(&hookData{span: span})
 				return mockCtx
 			},
 			statusCode: 200,
@@ -355,7 +397,7 @@ func TestAfterServeHTTP(t *testing.T) {
 			},
 			setupContext: func(tp *sdktrace.TracerProvider) hook.HookContext {
 				testTracer := tp.Tracer(instrumentationName)
-				ctx, span := testTracer.Start(
+				_, span := testTracer.Start(
 					context.Background(),
 					"GET",
 					trace.WithSpanKind(trace.SpanKindServer),
@@ -367,7 +409,7 @@ func TestAfterServeHTTP(t *testing.T) {
 				mockCtx := hooktest.NewMockHookContext()
 				mockCtx.SetParam(1, &writerWrapper{ResponseWriter: httptest.NewRecorder(), statusCode: 200})
 				mockCtx.SetParam(2, req)
-				mockCtx.SetData(map[string]interface{}{"ctx": ctx, "span": span})
+				mockCtx.SetData(&hookData{span: span})
 				return mockCtx
 			},
 			statusCode: 200,
@@ -386,7 +428,7 @@ func TestAfterServeHTTP(t *testing.T) {
 			},
 			setupContext: func(tp *sdktrace.TracerProvider) hook.HookContext {
 				testTracer := tp.Tracer(instrumentationName)
-				ctx, span := testTracer.Start(
+				_, span := testTracer.Start(
 					context.Background(),
 					"GET /set/by/gin",
 					trace.WithSpanKind(trace.SpanKindServer),
@@ -397,7 +439,7 @@ func TestAfterServeHTTP(t *testing.T) {
 				mockCtx := hooktest.NewMockHookContext()
 				mockCtx.SetParam(1, &writerWrapper{ResponseWriter: httptest.NewRecorder(), statusCode: 200})
 				mockCtx.SetParam(2, req)
-				mockCtx.SetData(map[string]interface{}{"ctx": ctx, "span": span})
+				mockCtx.SetData(&hookData{span: span})
 				return mockCtx
 			},
 			statusCode: 200,
@@ -553,4 +595,24 @@ func TestAfterServeHTTP_DisabledAfterStart_Regression(t *testing.T) {
 	ended = sr.Ended()
 	require.Len(t, ended, 1, "[] should have 1 item(s), but has 0")
 	assert.Equal(t, "GET", ended[0].Name())
+}
+
+// BenchmarkServeHTTPHooks measures the per-request overhead of the hook pair.
+// Run with -benchmem to see the allocation count.
+func BenchmarkServeHTTPHooks(b *testing.B) {
+	b.Setenv("OTEL_GO_ENABLED_INSTRUMENTATIONS", "nethttp")
+	initOnce = *new(sync.Once)
+	tp := sdktrace.NewTracerProvider()
+	otel.SetTracerProvider(tp)
+	b.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
+
+	req := httptest.NewRequest("GET", "http://example.com/path", nil)
+	w := httptest.NewRecorder()
+
+	b.ReportAllocs()
+	for b.Loop() {
+		mockCtx := hooktest.NewMockHookContext()
+		BeforeServeHTTP(mockCtx, nil, w, req)
+		AfterServeHTTP(mockCtx)
+	}
 }
